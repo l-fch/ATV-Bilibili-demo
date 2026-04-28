@@ -1,5 +1,5 @@
 //
-//  UpnpDMR.swift
+//  BiliBiliUpnpDMR.swift
 //  BilibiliLive
 //
 //  Created by yicheng on 2022/11/25.
@@ -14,12 +14,23 @@ import UIKit
 
 class BiliBiliUpnpDMR: NSObject {
     static let shared = BiliBiliUpnpDMR()
+
+    private let ssdpHost = "239.255.255.250"
+    private let ssdpPort: UInt16 = 1900
+    private let httpPort: in_port_t = 9958
+    private let mockServerName = "Linux/3.0.0, UPnP/1.0, Platinum/1.0.5.13"
+
+    private let udpQueue = DispatchQueue(label: "com.bilibili.upnp.udp")
+
+    weak var currentPlugin: BUpnpPlugin?
+
     private var udp: GCDAsyncUdpSocket!
     private var httpServer = HttpServer()
     private var connectedSockets = [GCDAsyncSocket]()
     @MainActor private var sessions = Set<NVASession>()
     private var started = false
     private var ip: String?
+    private var boardcastTimer: Timer?
 
     private lazy var serverInfo: String = {
         let file = Bundle.main.url(forResource: "DLNAInfo", withExtension: "xml")!
@@ -62,13 +73,13 @@ class BiliBiliUpnpDMR: NSObject {
             return HttpResponse.ok(.text(self?.serverInfo ?? ""))
         }
 
-        httpServer["projection"] = nvasocket(uuid: bUuid, didConnect: { [weak self] session in
-            Logger.info("session connected", session)
+        httpServer["/projection"] = nvasocket(uuid: bUuid, didConnect: { [weak self] session in
+            Logger.info("session connected \(session)")
             DispatchQueue.main.async {
                 self?.sessions.insert(session)
             }
         }, didDisconnect: { [weak self] session in
-            Logger.info("session disconnect", session)
+            Logger.info("session disconnect \(session)")
             DispatchQueue.main.async {
                 self?.sessions.remove(session)
             }
@@ -99,7 +110,7 @@ class BiliBiliUpnpDMR: NSObject {
             return HttpResponse.ok(.text(str))
         }
 
-        httpServer["AVTransport/event"] = {
+        httpServer["/AVTransport/event"] = {
             req in
             return HttpResponse.internalServerError(nil)
         }
@@ -113,19 +124,11 @@ class BiliBiliUpnpDMR: NSObject {
             }
             return HttpResponse.internalServerError(nil)
         }
-
-        httpServer["/debug/old"] = {
-            req in
-            if let path = Logger.oldestLogPath(),
-               let str = try? String(contentsOf: URL(fileURLWithPath: path))
-            {
-                return HttpResponse.ok(.text(str))
-            }
-            return HttpResponse.internalServerError(nil)
-        }
     }
 
     func stop() {
+        boardcastTimer?.invalidate()
+        boardcastTimer = nil
         udp?.close()
         httpServer.stop()
         started = false
@@ -146,20 +149,32 @@ class BiliBiliUpnpDMR: NSObject {
         stop()
         guard Settings.enableDLNA else { return }
         ip = getIPAddress()
-        if !started {
-            do {
-                udp = GCDAsyncUdpSocket(delegate: self, delegateQueue: DispatchQueue.main)
-                try udp.enableBroadcast(true)
-                try udp.bind(toPort: 1900)
-                try udp.joinMulticastGroup("239.255.255.250")
-                try udp.beginReceiving()
-                try httpServer.start(9958)
-                started = true
-                Logger.info("dmr started")
-            } catch let err {
-                started = false
-                Logger.warn("dmr start fail", err.localizedDescription)
-            }
+        do {
+            udp = GCDAsyncUdpSocket(delegate: self, delegateQueue: udpQueue)
+            try? udp.enableBroadcast(true)
+            try? udp.enableReusePort(true)
+            try? udp.bind(toPort: ssdpPort)
+            try? udp.joinMulticastGroup(ssdpHost)
+            try? udp.beginReceiving()
+            try httpServer.start(httpPort)
+            started = true
+            Logger.info("dmr started, http: \(httpPort), ssdp: \(ssdpPort)")
+        } catch let err {
+            started = false
+            udp?.close()
+            udp = nil
+            httpServer.stop()
+            Logger.warn("dmr start fail: \(err.localizedDescription).")
+            return
+        }
+        boardcastTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) {
+            [weak self] _ in
+            guard let self else { return }
+            guard started else { return }
+            guard let notify = getSSDPNotify(),
+                  let data = notify.data(using: .utf8)
+            else { return }
+            udp.send(data, toHost: ssdpHost, port: ssdpPort, withTimeout: 1, tag: 0)
         }
     }
 
@@ -194,22 +209,47 @@ class BiliBiliUpnpDMR: NSObject {
             Logger.debug("no ip")
             return ""
         }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "E, d MMM yyyy HH:mm:ss"
+
         return """
         HTTP/1.1 200 OK
-        LOCATION: http://\(ip):9958/description.xml
+        LOCATION: http://\(ip):\(httpPort)/description.xml
         CACHE-CONTROL: max-age=30
-        SERVER: Linux/3.0.0, UPnP/1.0, Platinum/1.0.5.13
+        SERVER: \(mockServerName)
         EXT:
         BOOTID.UPNP.ORG: 1669443520
         CONFIGID.UPNP.ORG: 10177363
         USN: uuid:atvbilibili&\(bUuid)::upnp:rootdevice
         ST: upnp:rootdevice
-        DATE: \(formatter.string(from: Date())) GMT
+        DATE: \(ssdpDateString())
 
         """
+    }
+
+    private func getSSDPNotify() -> String? {
+        guard let ip = ip ?? getIPAddress() else {
+            Logger.debug("no ip")
+            return nil
+        }
+        let text = """
+        NOTIFY * HTTP/1.1
+        Host: \(ssdpHost):\(ssdpPort)
+        Location: http://\(ip):9958/description.xml
+        Cache-Control: max-age=30
+        Server: \(mockServerName)
+        NTS: ssdp:alive
+        USN: uuid:\(bUuid)::urn:schemas-upnp-org:device:MediaRenderer:1
+        NT: urn:schemas-upnp-org:device:MediaRenderer:1
+
+        """
+        return text
+    }
+
+    private func ssdpDateString() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(abbreviation: "GMT")
+        formatter.dateFormat = "E, dd MMM yyyy HH:mm:ss 'GMT'"
+        return formatter.string(from: Date())
     }
 
     func handleEvent(frame: NVASession.NVAFrame, session: NVASession) {
@@ -221,21 +261,21 @@ class BiliBiliUpnpDMR: NSObject {
             handlePlay(json: JSON(parseJSON: frame.body))
             session.sendEmpty()
         case "Pause":
-            (topMost as? VideoPlayerViewController)?.player?.pause()
+            currentPlugin?.pause()
             session.sendEmpty()
         case "Resume":
-            (topMost as? VideoPlayerViewController)?.player?.play()
+            currentPlugin?.resume()
             session.sendEmpty()
         case "SwitchDanmaku":
             let json = JSON(parseJSON: frame.body)
-            (topMost as? VideoPlayerViewController)?.danMuView.isHidden = !json["open"].boolValue
+            Defaults.shared.showDanmu = json["open"].boolValue
             session.sendEmpty()
         case "Seek":
             let json = JSON(parseJSON: frame.body)
-            (topMost as? VideoPlayerViewController)?.player?.seek(to: CMTime(seconds: json["seekTs"].doubleValue, preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
+            currentPlugin?.seek(to: json["seekTs"].doubleValue)
             session.sendEmpty()
         case "Stop":
-            (topMost as? VideoPlayerViewController)?.dismiss(animated: true)
+            (topMost as? CommonPlayerViewController)?.dismiss(animated: true)
             session.sendEmpty()
         case "PlayUrl":
             let json = JSON(parseJSON: frame.body)
@@ -244,34 +284,23 @@ class BiliBiliUpnpDMR: NSObject {
                   let extStr = URLComponents(string: url.absoluteString)?.queryItems?
                   .first(where: { $0.name == "nva_ext" })?.value
             else {
-                Logger.warn("get play url: ", frame.body)
+                Logger.warn("get play url: \(frame.body)")
                 return
             }
             let ext = JSON(parseJSON: extStr)
             handlePlay(json: ext["content"])
         default:
-            Logger.debug("action:", frame.action)
+            Logger.debug("action: \(frame.action)")
             session.sendEmpty()
         }
     }
 
     func handlePlay(json: JSON) {
-        let topMost = UIViewController.topMostViewController()
-        let aid = json["aid"].intValue
-        let cid = json["cid"].intValue
-        let epid = json["epid"].intValue
-        let player: VideoDetailViewController
-        if epid > 0 {
-            player = VideoDetailViewController.create(epid: epid)
+        let roomId = json["roomId"].stringValue
+        if roomId.count > 0, let room = Int(roomId), room > 0 {
+            playLive(roomID: room)
         } else {
-            player = VideoDetailViewController.create(aid: aid, cid: cid)
-        }
-        if let _ = AppDelegate.shared.window!.rootViewController?.presentedViewController {
-            AppDelegate.shared.window!.rootViewController?.dismiss(animated: false) {
-                player.present(from: UIViewController.topMostViewController(), direatlyEnterVideo: true)
-            }
-        } else {
-            player.present(from: topMost, direatlyEnterVideo: true)
+            playVideo(json: json)
         }
     }
 
@@ -284,7 +313,7 @@ class BiliBiliUpnpDMR: NSObject {
     }
 
     @MainActor func sendStatus(status: PlayStatus) {
-        Logger.debug("send status:", status)
+        Logger.debug("send status: \(status)")
         Array(sessions).forEach { $0.sendCommand(action: "OnPlayState", content: ["playState": status.rawValue]) }
     }
 
@@ -313,13 +342,42 @@ class BiliBiliUpnpDMR: NSObject {
     }
 }
 
+extension BiliBiliUpnpDMR {
+    func playLive(roomID: Int) {
+        let player = LivePlayerViewController()
+        player.room = LiveRoom(title: "", room_id: roomID, uname: "", area_v2_name: "", keyframe: nil, face: nil, cover_from_user: nil)
+        UIViewController.topMostViewController().present(player, animated: true)
+    }
+
+    func playVideo(json: JSON) {
+        let aid = json["aid"].intValue
+        let cid = json["cid"].intValue
+        let epid = json["epid"].intValue
+
+        let player: VideoDetailViewController
+        if epid > 0 {
+            player = VideoDetailViewController.create(epid: epid)
+        } else {
+            player = VideoDetailViewController.create(aid: aid, cid: cid)
+        }
+        let topMost = UIViewController.topMostViewController()
+        if let _ = AppDelegate.shared.window!.rootViewController?.presentedViewController {
+            AppDelegate.shared.window!.rootViewController?.dismiss(animated: false) {
+                player.present(from: UIViewController.topMostViewController(), direatlyEnterVideo: true)
+            }
+        } else {
+            player.present(from: topMost, direatlyEnterVideo: true)
+        }
+    }
+}
+
 extension BiliBiliUpnpDMR: GCDAsyncUdpSocketDelegate {
     func udpSocket(_ sock: GCDAsyncUdpSocket, didReceive data: Data, fromAddress address: Data, withFilterContext filterContext: Any?) {
         var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
         address.withUnsafeBytes { (pointer: UnsafeRawBufferPointer) in
             let sockaddrPtr = pointer.bindMemory(to: sockaddr.self)
             guard let unsafePtr = sockaddrPtr.baseAddress else { return }
-            guard getnameinfo(unsafePtr, socklen_t(data.count), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 else {
+            guard getnameinfo(unsafePtr, socklen_t(address.count), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 else {
                 return
             }
         }

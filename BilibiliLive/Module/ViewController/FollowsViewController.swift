@@ -1,5 +1,5 @@
 //
-//  F.swift
+//  FollowsViewController.swift
 //  BilibiliLive
 //
 //  Created by Etan Chen on 2021/4/4.
@@ -9,68 +9,190 @@ import Alamofire
 import SwiftyJSON
 import UIKit
 
-class FollowsViewController: StandardVideoCollectionViewController<FeedData> {
-    override func request(page: Int) async throws -> [FeedData] {
-        return try await WebRequest.requestFollowsFeed(page: page)
+class FollowsViewController: StandardVideoCollectionViewController<DynamicFeedData> {
+    var lastOffset = ""
+
+    override func setupCollectionView() {
+        super.setupCollectionView()
+        collectionVC.pageSize = 1
     }
 
-    override func goDetail(with feed: FeedData) {
-        if let bangumi = feed.bangumi {
-            let detailVC = VideoDetailViewController.create(epid: bangumi.new_ep.episode_id)
-            detailVC.present(from: self)
-        } else {
-            // 发现这个旧feed接口的bangumi字段一直为nil，只有archive中有正确的ep_id值，港澳台解锁需要获取该值
-            var epid: Int?
-            if let redirect = feed.archive?.redirect_url?.lastPathComponent, redirect.starts(with: "ep") {
-                epid = Int(redirect.dropFirst(2))
-            }
-            let detailVC = VideoDetailViewController.create(aid: feed.aid, cid: feed.cid, epid: epid)
-            detailVC.present(from: self)
+    override func request(page: Int) async throws -> [DynamicFeedData] {
+        if page == 1 {
+            lastOffset = ""
         }
+        let info = try await WebRequest.requestFollowsFeed(offset: lastOffset, page: page)
+        lastOffset = info.offset
+        Logger.debug("request page\(page) get count:\(info.videoFeeds.count) next offset:\(info.offset)")
+        return info.videoFeeds
+    }
+
+    override func goDetail(with feed: DynamicFeedData) {
+        let epid = feed.modules.module_dynamic.major?.pgc?.epid
+        let detailVC = VideoDetailViewController.create(aid: feed.aid, cid: feed.cid, epid: epid)
+        detailVC.present(from: self)
     }
 }
 
 extension WebRequest {
-    static func requestFollowsFeed(page: Int) async throws -> [FeedData] {
-        return try await request(url: "https://api.bilibili.com/x/web-feed/feed", parameters: ["ps": 40, "pn": page])
+    struct DynamicFeedInfo: Codable {
+        let items: [DynamicFeedData]
+        let offset: String
+        let update_num: Int
+        let update_baseline: String
+        let has_more: Bool
+        var videoFeeds: [DynamicFeedData] {
+            return items
+                .filter({ $0.aid != 0 || $0.modules.module_dynamic.major?.pgc != nil })
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case items, offset, update_num, update_baseline, has_more
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            items = try container.decode([DynamicFeedData].self, forKey: .items)
+            offset = try container.decode(String.self, forKey: .offset)
+            if let intVal = try? container.decode(Int.self, forKey: .update_num) {
+                update_num = intVal
+            } else if let strVal = try? container.decode(String.self, forKey: .update_num) {
+                update_num = Int(strVal) ?? 0
+            } else {
+                update_num = 0
+            }
+            update_baseline = try container.decode(String.self, forKey: .update_baseline)
+            has_more = try container.decode(Bool.self, forKey: .has_more)
+        }
+    }
+
+    static func requestFollowsFeed(offset: String, page: Int) async throws -> DynamicFeedInfo {
+        var param: [String: Any] = ["type": "all", "timezone_offset": "-480", "page": page]
+        if let offsetNum = Int(offset) {
+            param["offset"] = offsetNum
+        }
+        let res: DynamicFeedInfo = try await request(url: "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", parameters: param)
+        if res.videoFeeds.isEmpty, res.has_more {
+            return try await requestFollowsFeed(offset: res.offset, page: page)
+        }
+        return res
     }
 }
 
-struct FeedData: Decodable, PlayableData {
-    struct Bangumi: Decodable, Hashable {
-        let season_id: Int
-        let title: String
-        let cover: URL
-        struct EP: Decodable, Hashable {
-            let index: String
-            let index_title: String?
-            let episode_id: Int
+struct DynamicFeedData: Codable, PlayableData, DisplayData {
+    var aid: Int {
+        if let str = modules.module_dynamic.major?.archive?.aid {
+            return Int(str) ?? 0
+        }
+        return 0
+    }
+
+    var cid: Int { return 0 }
+
+    var title: String {
+        return modules.module_dynamic.major?.archive?.title ?? modules.module_dynamic.major?.pgc?.title ?? ""
+    }
+
+    var ownerName: String {
+        return modules.module_author.name
+    }
+
+    var pic: URL? {
+        return URL(string: modules.module_dynamic.major?.archive?.cover ?? "") ?? modules.module_dynamic.major?.pgc?.cover
+    }
+
+    var avatar: URL? {
+        return URL(string: modules.module_author.face)
+    }
+
+    var date: String? {
+        return modules.module_author.pub_time
+    }
+
+    var overlay: DisplayOverlay? {
+        var leftItems = [DisplayOverlay.DisplayOverlayItem]()
+        var rightItems = [DisplayOverlay.DisplayOverlayItem]()
+        if let stat = modules.module_dynamic.major?.archive?.stat {
+            if let play = stat.play {
+                leftItems.append(DisplayOverlay.DisplayOverlayItem(icon: "play.rectangle", text: play == "0" ? "-" : "\(play)"))
+            }
+            if let danmaku = stat.danmaku {
+                leftItems.append(DisplayOverlay.DisplayOverlayItem(icon: "list.bullet.rectangle", text: danmaku == "0" ? "-" : "\(danmaku)"))
+            }
+        }
+        if let durationText = modules.module_dynamic.major?.archive?.duration_text {
+            rightItems.append(DisplayOverlay.DisplayOverlayItem(icon: nil, text: durationText))
+        }
+        return DisplayOverlay(leftItems: leftItems, rightItems: rightItems)
+    }
+
+    let type: String
+    let basic: Basic
+    let modules: Modules
+    let id_str: String
+
+    struct Basic: Codable, Hashable {
+        let comment_id_str: String
+        let comment_type: Int
+    }
+
+    struct Modules: Codable, Hashable {
+        let module_author: ModuleAuthor
+        let module_dynamic: ModuleDynamic
+
+        struct ModuleAuthor: Codable, Hashable {
+            let face: String
+            let mid: Int
+            let name: String
+            let pub_time: String
         }
 
-        let new_ep: EP
+        struct ModuleDynamic: Codable, Hashable {
+            let major: Major?
+
+            struct Major: Codable, Hashable {
+                let archive: Archive?
+                let pgc: Pgc?
+
+                struct Archive: Codable, Hashable {
+                    let aid: String?
+                    let cover: String?
+                    let desc: String?
+                    let title: String?
+                    let duration_text: String?
+                    let stat: Stat?
+
+                    struct Stat: Codable, Hashable {
+                        let danmaku: String?
+                        let play: String?
+                    }
+                }
+
+                struct Pgc: Codable, Hashable {
+                    let epid: Int?
+                    let title: String?
+                    let cover: URL?
+                    let jump_url: URL?
+
+                    enum CodingKeys: String, CodingKey {
+                        case epid, title, cover, jump_url
+                    }
+
+                    init(from decoder: Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        if let intVal = try? container.decodeIfPresent(Int.self, forKey: .epid) {
+                            epid = intVal
+                        } else if let strVal = try? container.decodeIfPresent(String.self, forKey: .epid) {
+                            epid = Int(strVal)
+                        } else {
+                            epid = nil
+                        }
+                        title = try container.decodeIfPresent(String.self, forKey: .title)
+                        cover = try container.decodeIfPresent(URL.self, forKey: .cover)
+                        jump_url = try container.decodeIfPresent(URL.self, forKey: .jump_url)
+                    }
+                }
+            }
+        }
     }
-
-    struct Archive: Decodable, Hashable {
-        let title: String
-        let cid: Int
-        let owner: VideoOwner
-        let pic: URL
-        let redirect_url: URL?
-    }
-
-    let id: Int
-    let pubdate: Int
-    let bangumi: Bangumi?
-    let archive: Archive?
-
-    // PlayableData
-    var cid: Int { 0 }
-    var aid: Int { id }
-
-    // DisplayData
-    var title: String { (archive != nil) ? archive!.title : bangumi!.title }
-    var ownerName: String { (archive != nil) ? archive!.owner.name : bangumi!.title }
-    var pic: URL? { (archive != nil) ? archive!.pic : bangumi!.cover }
-    var avatar: URL? { URL(string: archive?.owner.face ?? "") }
-    var date: String? { DateFormatter.stringFor(timestamp: pubdate) }
 }
